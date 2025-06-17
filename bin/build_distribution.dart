@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:googleapis_auth/auth_io.dart';
-import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:path/path.dart' as p;
 
@@ -30,7 +29,7 @@ String getFolderIdFromFlavor(Map<String, dynamic> folders, String flavor) {
 Future<void> main(List<String> args) async {
   if (args.length < 4) {
     print(
-      'Использование: build_distribution <apk_path> <build_name> <build_number> <flavor>',
+      'Использование: build_distribution <apk_path> <build_name> <build_number> <flavor> [description]',
     );
     exit(1);
   }
@@ -39,10 +38,14 @@ Future<void> main(List<String> args) async {
   final buildName = args[1];
   final buildNumber = args[2];
   final flavor = args[3];
+  final description = args.length >= 5 ? args[4] : null;
 
   print('Путь к apk: $apkPath');
   print('Build Name: $buildName');
   print('Build Number: $buildNumber');
+  if (description != null) {
+    print('Описание: $description');
+  }
 
   final config = await loadConfig();
 
@@ -54,57 +57,89 @@ Future<void> main(List<String> args) async {
   final httpClient = await clientViaServiceAccount(credentials, _scopes);
 
   final driveApi = drive.DriveApi(httpClient);
-  final fileToUpload = File(apkPath);
-  final fileLength = fileToUpload.lengthSync();
-  if (!fileToUpload.existsSync()) {
+  final apkFile = File(apkPath);
+  // final fileLength = apkFile.lengthSync();
+  if (!apkFile.existsSync()) {
     print("Файл не найден");
     return;
   }
 
-  final fileName = '$buildName($buildNumber).apk';
+  final apkFileName = '$buildName($buildNumber).apk';
   final folderId = getFolderIdFromFlavor(folders, flavor);
 
-  final existingFiles = await driveApi.files.list(
-    q: "name = '$fileName' and '$folderId' in parents and trashed = false",
+  final existingApk = await driveApi.files.list(
+    q: "name = '$apkFileName' and '$folderId' in parents and trashed = false",
     spaces: 'drive',
     $fields: 'files(id, name)',
   );
 
-  if (existingFiles.files != null && existingFiles.files!.isNotEmpty) {
+  if (existingApk.files != null && existingApk.files!.isNotEmpty) {
     throw Exception(
-      "❌ Файл с именем '$fileName' уже существует в Google Drive папке.",
+      "❌ Файл с именем '$apkFileName' уже существует в Google Drive папке.",
     );
   }
 
-  final stream = fileToUpload.openRead();
+  final apkStream = apkFile.openRead();
 
-  int uploadedBytes = 0;
-  final monitoredStream = stream.transform(
-    StreamTransformer<List<int>, List<int>>.fromHandlers(
-      handleData: (data, sink) {
-        uploadedBytes += data.length;
-        final progress = (uploadedBytes / fileLength * 100).toStringAsFixed(2);
-        stdout.write("\r📤 Загрузка: $progress%"); // \r — перезаписывает строку
-        sink.add(data);
-      },
-      handleError: (error, stackTrace, sink) =>
-          sink.addError(error, stackTrace),
-      handleDone: (sink) => sink.close(),
-    ),
+  final apkMedia = drive.Media(
+    apkStream.transform(progressMonitor(apkFile.lengthSync())),
+    apkFile.lengthSync(),
   );
+  final apkDriveFile = drive.File()
+    ..name = apkFileName
+    ..parents = [folderId]; // <-- ID общей папки
 
-  final media = drive.Media(monitoredStream, fileToUpload.lengthSync());
-  final driveFile = drive.File();
-  driveFile.name = fileName;
-  driveFile.parents = [folderId]; // <-- ID общей папки
-
-  final uploadedFile = await driveApi.files.create(
-    driveFile,
-    uploadMedia: media,
+  final uploadedApk = await driveApi.files.create(
+    apkDriveFile,
+    uploadMedia: apkMedia,
   );
+  print("\n✅ APK загружен! ID: ${uploadedApk.id}");
+  print("🔗 https://drive.google.com/file/d/${uploadedApk.id}/view");
 
-  print("✅ Загружено! ID файла: ${uploadedFile.id}");
-  print("🔗 Ссылка: https://drive.google.com/file/d/${uploadedFile.id}/view");
+  // 📄 Если есть description — создаём и загружаем TXT
+  if (description != null) {
+    final txtFileName = '$buildName($buildNumber).txt';
+
+    final tmpDir = Directory.systemTemp;
+    final tmpTxtPath = p.join(tmpDir.path, txtFileName);
+    final txtFile = File(tmpTxtPath)..writeAsStringSync(description);
+
+    final existingTxt = await driveApi.files.list(
+      q: "name = '$txtFileName' and '$folderId' in parents and trashed = false",
+      spaces: 'drive',
+      $fields: 'files(id, name)',
+    );
+
+    if (existingTxt.files != null && existingTxt.files!.isNotEmpty) {
+      throw Exception("❌ Описание '$txtFileName' уже существует в папке.");
+    }
+
+    final txtMedia = drive.Media(txtFile.openRead(), txtFile.lengthSync());
+    final txtDriveFile = drive.File()
+      ..name = txtFileName
+      ..parents = [folderId];
+
+    final uploadedTxt = await driveApi.files.create(
+      txtDriveFile,
+      uploadMedia: txtMedia,
+    );
+
+    print("✅ Описание загружено! ID: ${uploadedTxt.id}");
+    print("🔗 https://drive.google.com/file/d/${uploadedTxt.id}/view");
+  }
 
   httpClient.close();
+}
+
+StreamTransformer<List<int>, List<int>> progressMonitor(int totalSize) {
+  int uploadedBytes = 0;
+  return StreamTransformer<List<int>, List<int>>.fromHandlers(
+    handleData: (data, sink) {
+      uploadedBytes += data.length;
+      final progress = (uploadedBytes / totalSize * 100).toStringAsFixed(2);
+      stdout.write("\r📤 Загрузка: $progress%");
+      sink.add(data);
+    },
+    handleDone: (sink) => sink.close(),
+  );
 }
