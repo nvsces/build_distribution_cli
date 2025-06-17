@@ -6,7 +6,7 @@ executables:
   build_distribution:
 
 environment:
-  sdk: ^3.8.1
+  sdk: ">=3.7.0 <4.0.0"
 
 # Add regular dependencies here.
 dependencies:
